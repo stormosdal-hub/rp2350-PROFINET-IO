@@ -1,0 +1,50 @@
+diff --git a/src/device/pf_pdport.c b/src/device/pf_pdport.c
+index ea4df85..95c898f 100644
+--- a/src/device/pf_pdport.c
++++ b/src/device/pf_pdport.c
+@@ -831,11 +831,13 @@ static void pf_pdport_check_peer_station_name (pnet_t * net, int loc_port_num)
+    {
+       pf_pdport_init_diag_source (net, &diag_source, loc_port_num);
+ 
++      /* ESP32-P4 port: exact match, not just a matching prefix */
+       if (
+-         strncmp (
+-            lldp_station_name.string,
+-            (char *)p_wanted_peer->peer_station_name,
+-            lldp_station_name.len) == 0)
++         (lldp_station_name.len == p_wanted_peer->length_peer_station_name) &&
++         (strncmp (
++             lldp_station_name.string,
++             (char *)p_wanted_peer->peer_station_name,
++             lldp_station_name.len) == 0))
+       {
+          peer_stationname_is_correct = true;
+       }
+@@ -901,17 +903,21 @@ static void pf_pdport_check_peer_port_name (pnet_t * net, int loc_port_num)
+    pnet_diag_source_t diag_source = {0};
+    pf_port_t * p_port_data = pf_port_get_state (net, loc_port_num);
+    pf_check_peer_t * p_wanted_peer = &p_port_data->pdport.check.peer;
+-   pf_lldp_port_id_t lldp_port_id;
++   pf_lldp_port_name_t lldp_port_id;
+ 
+-   if (pf_lldp_get_peer_port_id (net, loc_port_num, &lldp_port_id) == 0)
++   /* ESP32-P4 port: compare the port name, without the ".station" part
++    * a peer in standard name mode adds to its port ID ("port-001.plc"),
++    * and compare all of it, not just a matching prefix */
++   if (pf_lldp_get_peer_port_name (net, loc_port_num, &lldp_port_id) == 0)
+    {
+       pf_pdport_init_diag_source (net, &diag_source, loc_port_num);
+ 
+       if (
+-         strncmp (
+-            lldp_port_id.string,
+-            (char *)p_wanted_peer->peer_port_name,
+-            lldp_port_id.len) == 0)
++         (lldp_port_id.len == p_wanted_peer->length_peer_port_name) &&
++         (strncmp (
++             lldp_port_id.string,
++             (char *)p_wanted_peer->peer_port_name,
++             lldp_port_id.len) == 0))
+       {
+          peer_portname_is_correct = true;
+       }

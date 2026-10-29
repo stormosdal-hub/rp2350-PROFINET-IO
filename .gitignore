@@ -1,0 +1,3 @@
+build/
+# FreeRTOS-Kernel is cloned here (see README), not part of this repository
+lib/FreeRTOS-Kernel/
