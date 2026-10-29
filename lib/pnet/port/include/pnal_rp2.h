@@ -34,12 +34,16 @@ typedef struct pnal_rp2_eth_driver {
 /*
  * The interface p-net runs on: lwIP's netif for the MAC and the IP suite, the driver for raw frames
  * and the link. Call it before pnet_init(). From then on the driver hands PROFINET (0x8892) and
- * LLDP (0x88CC) frames to pnal_rp2_input().
+ * LLDP (0x88CC) frames to pnal_rp2_input(), which passes them on after pnal_rp2_start_input().
  */
 int pnal_rp2_attach(struct netif *netif, const pnal_rp2_eth_driver_t *driver);
 
 /* What pnal_rp2_is_pnet_frame() needs of a frame: up to two VLAN tags and the type after them. */
 #define PNAL_RP2_CLASSIFY_LEN 24
+
+/* Start handing received frames to p-net: call it once pnet_init() (app_init()) has returned.
+ * Until then they are dropped, and counted as discards. */
+void pnal_rp2_start_input(void);
 
 /* A frame for p-net: PROFINET or LLDP, also behind VLAN tags as controllers send them. */
 bool pnal_rp2_is_pnet_frame(const uint8_t *frame, size_t len);

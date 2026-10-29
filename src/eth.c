@@ -28,8 +28,10 @@
 
 static const char *TAG = "eth";
 
-#define LINK_POLL_MS 250   // the PHY's link, speed and duplex
-#define RX_POLL_MS   10    // the receive buffer, should INTn ever be missed
+#define LINK_POLL_MS  250    // the PHY's link, speed and duplex
+#define RX_POLL_MS    2      // the receive buffer, should INTn ever be missed
+#define RX_BUDGET_US  1000   // reading frames at a stretch, before the lower tasks get a tick
+#define TX_RETRIES    3      // frames in a row the chip does not confirm before its socket is reopened
 
 static const w5500_cfg_t chip_cfg = {
     .spi = SPI_INSTANCE(BOARD_ETH_SPI),
@@ -42,10 +44,12 @@ static const w5500_cfg_t chip_cfg = {
 };
 
 static struct netif netif;
+NETIF_DECLARE_EXT_CALLBACK(netif_change)
 static SemaphoreHandle_t chip;   // the SPI bus and the W5500: one task at a time
 static TaskHandle_t rx_task;
 static pnal_rp2_link_t link;     // as last read from the PHY
 static uint8_t mac[6];
+static unsigned tx_failures;     // in a row; under the chip lock
 
 static void lock(void) { xSemaphoreTake(chip, portMAX_DELAY); }
 static void unlock(void) { xSemaphoreGive(chip); }
@@ -81,6 +85,30 @@ static void make_mac(uint8_t out[6])
     for (int i = 1; i < 6; i++) out[i] = (uint8_t)(h >> (8 * (i - 1)));
 }
 
+// A micro SD card shares SPI0. It powers up in SD mode, where it listens to CMD (here MOSI) on
+// every clock whatever its CS says, and may answer on it. CMD0 with CS low puts it in SPI mode,
+// in which CS high (GP7, kept high by board.c) takes it off the bus. true: a card answered
+static bool sd_card_off_bus(void)
+{
+    static const uint8_t cmd0[6] = { 0x40, 0, 0, 0, 0, 0x95 };   // GO_IDLE_STATE, with its CRC
+    uint8_t ones[10], r1 = 0xff;
+    memset(ones, 0xff, sizeof(ones));
+    spi_init(chip_cfg.spi, 400000);   // the SD card's 400 kHz until it is initialised
+    gpio_set_function(chip_cfg.sck, GPIO_FUNC_SPI);
+    gpio_set_function(chip_cfg.mosi, GPIO_FUNC_SPI);
+    gpio_set_function(chip_cfg.miso, GPIO_FUNC_SPI);
+    for (int attempt = 0; attempt < 3 && r1 != 0x01; attempt++) {
+        gpio_put(BOARD_SD_CS_PIN, 1);
+        spi_write_blocking(chip_cfg.spi, ones, sizeof(ones));   // at least 74 clocks, deselected
+        gpio_put(BOARD_SD_CS_PIN, 0);
+        spi_write_blocking(chip_cfg.spi, cmd0, sizeof(cmd0));
+        for (int i = 0; i < 10 && r1 == 0xff; i++) spi_read_blocking(chip_cfg.spi, 0xff, &r1, 1);
+        gpio_put(BOARD_SD_CS_PIN, 1);
+        spi_write_blocking(chip_cfg.spi, ones, 1);   // the card lets go of MISO
+    }
+    return r1 == 0x01;
+}
+
 // one frame out, from a pbuf chain (lwIP) or a buffer (p-net)
 static bool transmit(const struct pbuf *p, const uint8_t *frame, size_t len)
 {
@@ -93,10 +121,16 @@ static bool transmit(const struct pbuf *p, const uint8_t *frame, size_t len)
             w5500_tx_append(frame, len);
         }
         ok = w5500_tx_commit();
-        if (!ok) reopened = w5500_reopen();   // the chip did not confirm: start its socket over
+        if (ok) {
+            tx_failures = 0;
+        } else if (++tx_failures >= TX_RETRIES) {   // the chip keeps not confirming: start its socket over
+            tx_failures = 0;
+            reopened = true;
+            w5500_reopen();
+        }
     }
     unlock();
-    if (!ok && reopened) LOGW(TAG, "a frame was not confirmed sent: socket reopened");
+    if (reopened) LOGW(TAG, "%d frames in a row not confirmed sent: socket reopened", TX_RETRIES);
     return ok;
 }
 
@@ -134,10 +168,12 @@ static err_t init_netif(struct netif *n)
     return ERR_OK;
 }
 
-// the address as DCP sets it: TIA Portal's "Assign IP address", or the PLC when it connects
-static void on_status(struct netif *n)
+// the address as DCP sets it: TIA Portal's "Assign IP address", or the PLC when it connects.
+// Once netif_set_addr() has set all three, and only if one of them changed
+static void on_netif_change(struct netif *n, netif_nsc_reason_t reason, const netif_ext_callback_args_t *args)
 {
     char ip[IP4ADDR_STRLEN_MAX], mask[IP4ADDR_STRLEN_MAX], gw[IP4ADDR_STRLEN_MAX];
+    if (!(reason & LWIP_NSC_IPV4_SETTINGS_CHANGED)) return;
     ip4addr_ntoa_r(netif_ip4_addr(n), ip, sizeof(ip));
     ip4addr_ntoa_r(netif_ip4_netmask(n), mask, sizeof(mask));
     ip4addr_ntoa_r(netif_ip4_gw(n), gw, sizeof(gw));
@@ -212,13 +248,17 @@ static bool receive_one(void)
 static void check_link(void)
 {
     w5500_phy_t phy;
-    bool socket_ok, restarted = false;
+    bool settings_ok, socket_ok, fixed = true;
     lock();
-    socket_ok = w5500_socket_ok();
-    if (!socket_ok) restarted = w5500_init(&chip_cfg, mac) >= 0;   // reset under us (brown-out?): set it up again
+    // read twice: one bad read is not worth a reset, which restarts the PHY (seconds without link)
+    settings_ok = w5500_settings_ok() || w5500_settings_ok();
+    socket_ok = w5500_socket_ok() || w5500_socket_ok();
+    if (!settings_ok) fixed = w5500_init(&chip_cfg, mac) >= 0;   // reset under us (brown-out?): set it up again
+    else if (!socket_ok) fixed = w5500_reopen();
     w5500_get_phy(&phy);
     unlock();
-    if (!socket_ok) LOGW(TAG, "the W5500 lost its settings: %s", restarted ? "set up again" : "no answer");
+    if (!settings_ok) LOGW(TAG, "the W5500 lost its settings: %s", fixed ? "set up again" : "no answer");
+    else if (!socket_ok) LOGW(TAG, "the MACRAW socket was closed: %s", fixed ? "reopened" : "did not reopen");
 
     pnal_rp2_link_t now = { .up = phy.link, .speed_100 = phy.speed_100, .full_duplex = phy.full_duplex };
     bool changed = now.up != link.up;
@@ -258,14 +298,22 @@ static void rx_task_fn(void *arg)
             check_link();
             next_link_check = make_timeout_time_ms(LINK_POLL_MS);
         }
-        // clear the interrupt, then empty the buffer; INTn low again: a frame came in meanwhile
-        for (int round = 0; round < 4; round++) {
+        // clear the interrupt, then empty the buffer; INTn low again: a frame came in meanwhile.
+        // This task is above pnio: under a flood it stops after RX_BUDGET_US and sleeps a tick,
+        // so the 1 ms tick and the cyclic frames still run (the W5500 keeps 16 KB meanwhile)
+        uint32_t start = time_us_32();
+        bool more = true, over = false;
+        while (more && !over) {
             lock();
             w5500_clear_rx_interrupt();
             unlock();
-            while (receive_one()) {
-            }
-            if (gpio_get(BOARD_ETH_INT_PIN)) break;
+            while (!over && receive_one()) over = time_us_32() - start > RX_BUDGET_US;
+            more = !gpio_get(BOARD_ETH_INT_PIN);
+            over = over || time_us_32() - start > RX_BUDGET_US;
+        }
+        if (over) {
+            xTaskNotifyGive(rx_task);   // come straight back after it
+            vTaskDelay(1);
         }
     }
 }
@@ -275,6 +323,7 @@ int eth_start(void)
     chip = xSemaphoreCreateMutex();
     if (!chip) return -1;
     make_mac(mac);
+    if (sd_card_off_bus()) LOGI(TAG, "SD card in the slot: set to SPI mode, so it stays off the W5500's bus");
     lock();
     int version = w5500_init(&chip_cfg, mac);
     unlock();
@@ -291,9 +340,9 @@ int eth_start(void)
     default_address(&ip, &mask, &gw);
     tcpip_init(NULL, NULL);
     LOCK_TCPIP_CORE();
+    netif_add_ext_callback(&netif_change, on_netif_change);
     struct netif *n = netif_add(&netif, &ip, &mask, &gw, NULL, init_netif, tcpip_input);
     if (n) {
-        netif_set_status_callback(&netif, on_status);
         netif_set_default(&netif);
         netif_set_up(&netif);
     }

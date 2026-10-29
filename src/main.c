@@ -10,6 +10,7 @@
 #include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
+#include "hardware/watchdog.h"
 #include "pico/stdlib.h"
 #include "app_log.h"
 #include "app_utils.h"
@@ -22,6 +23,10 @@
 #include "log.h"
 
 static const char *TAG = "pnio";
+
+// why the last start was a reset by the fault handlers below (watchdog scratch registers survive it)
+#define FAULT_MAGIC 0x50464c54u   // "PFLT"
+enum { FAULT_STACK = 1, FAULT_HARD, FAULT_PANIC };
 
 // p-net keeps pointers into these: they live as long as the device runs
 static pnet_cfg_t pnet_cfg;
@@ -56,11 +61,17 @@ static void pnio_task(void *arg)
     pnet_cfg.pnal_cfg.bg_worker_thread = (pnal_thread_cfg_t){ .prio = PNIO_BG_TASK_PRIO,
                                                               .stack_size = PNIO_BG_TASK_STACK };
 
-    app_data_t *app = app_init(&pnet_cfg);
-    if (!app || app_start(app, RUN_IN_MAIN_THREAD) != 0) {
+    app_data_t *app = app_init(&pnet_cfg);   // pnet_init()
+    if (!app) {
         LOGE(TAG, "p-net did not start");
         vTaskDelete(NULL);
     }
+    pnal_rp2_start_input();   // received PROFINET and LLDP frames to p-net from now on
+    if (app_start(app, RUN_IN_MAIN_THREAD) != 0) {
+        LOGE(TAG, "p-net did not start");
+        vTaskDelete(NULL);
+    }
+    board_watchdog_start();
     LOGI(TAG, "p-net running: waiting for TIA Portal or the PLC");   // the name in use: CMINA "Setting IP" above
     app_loop_forever(app);   // never returns
 }
@@ -69,6 +80,14 @@ static void pnio_task(void *arg)
 static void start_task(void *arg)
 {
     LOGI(TAG, "RP2350 PROFINET IO device, p-net %s, FreeRTOS %s", PNET_VERSION, tskKERNEL_VERSION_NUMBER);
+    static const char *const fault_names[] = { "", "stack overflow", "hard fault", "panic" };
+    uint32_t fault = watchdog_hw->scratch[0] == FAULT_MAGIC ? watchdog_hw->scratch[1] : 0;
+    if (watchdog_caused_reboot() && fault >= FAULT_STACK && fault <= FAULT_PANIC) {
+        LOGW(TAG, "restarted after a %s", fault_names[fault]);
+    } else if (watchdog_enable_caused_reboot()) {
+        LOGW(TAG, "restarted by the watchdog: the main loop had stopped");
+    }
+    watchdog_hw->scratch[0] = 0;
     board_start();
     if (eth_start() != 0) {
         LOGE(TAG, "no Ethernet: PROFINET not started");
@@ -91,10 +110,24 @@ int main(void)
     return 0;
 }
 
-void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
+// A fault anywhere: the 24 V outputs off at once, then a clean restart through the watchdog. (The
+// SDK's own handlers stop the core, and the outputs would stay as they were.)
+static void __attribute__((noreturn)) restart(uint32_t fault)
 {
-    panic("stack overflow in task %s", name);
+    board_outputs_off();
+    watchdog_hw->scratch[0] = FAULT_MAGIC;
+    watchdog_hw->scratch[1] = fault;
+    watchdog_reboot(0, 0, 0);
+    for (;;) {
+    }
 }
+
+void vApplicationStackOverflowHook(TaskHandle_t task, char *name) { restart(FAULT_STACK); }
+
+void isr_hardfault(void) { restart(FAULT_HARD); }
+
+// where panic() (and lwIP's and p-net's failed asserts) end, after printing their message
+void __attribute__((noreturn)) _exit(int status) { restart(FAULT_PANIC); }
 
 void vApplicationMallocFailedHook(void)
 {

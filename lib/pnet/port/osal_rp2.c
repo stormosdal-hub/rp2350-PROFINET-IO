@@ -98,6 +98,8 @@ static int64_t on_alarm(alarm_id_t id, void *user_data)
 {
     os_timer_t *t = user_data;
     BaseType_t woken = pdFALSE;
+    // the SDK still fires a cancelled alarm that was already due: stopped or restarted since
+    if (id != t->alarm) return 0;
     t->due = true;
     vTaskNotifyGiveFromISR(timer_task, &woken);
     portYIELD_FROM_ISR(woken);
@@ -118,13 +120,15 @@ static void timer_task_fn(void *arg)
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         xSemaphoreTakeRecursive(timers_lock, portMAX_DELAY);
+        // from the start after each callback: it may have destroyed another timer
         for (os_timer_t *t = timers; t;) {
-            os_timer_t *next = t->next;
-            if (t->due) {
-                t->due = false;
-                if (t->fn) t->fn(t, t->arg);
+            if (!t->due) {
+                t = t->next;
+                continue;
             }
-            t = next;
+            t->due = false;
+            if (t->fn) t->fn(t, t->arg);
+            t = timers;
         }
         xSemaphoreGiveRecursive(timers_lock);
     }
@@ -173,11 +177,15 @@ void os_timer_start(os_timer_t *timer)
 {
     cancel(timer);
     taskENTER_CRITICAL();
-    timer->at = time_us_64() + (timer->us ? timer->us : 1);
-    alarm_id_t id = alarm_pool_add_alarm_at(alarm_pool_get_default(), from_us_since_boot(timer->at), on_alarm,
-                                            timer, false);
+    alarm_id_t id = 0;
+    // 0: the time passed before the alarm could be set (a period of a few us); try a little later
+    for (uint32_t margin = 0; id == 0 && margin <= 200; margin += 100) {
+        timer->at = time_us_64() + (timer->us ? timer->us : 1) + margin;
+        id = alarm_pool_add_alarm_at(alarm_pool_get_default(), from_us_since_boot(timer->at), on_alarm, timer,
+                                     false);
+    }
     timer->alarm = id > 0 ? id : 0;
-    if (id <= 0) timer->due = true;   // already past (0), or no free alarm (<0): run it now
+    if (id <= 0) timer->due = true;   // no free alarm: run it once now, and say so
     taskEXIT_CRITICAL();
     if (id < 0) os_log(LOG_LEVEL_ERROR, "os_timer: no free alarm (PICO_TIME_DEFAULT_ALARM_POOL_MAX_TIMERS)\n");
     if (id <= 0) xTaskNotifyGive(timer_task);

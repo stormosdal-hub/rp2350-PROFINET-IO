@@ -1127,7 +1127,10 @@ int pf_fspm_cm_write_ind (
 
       if (ret == 0)
       {
-         pf_fspm_save_im (net);
+         /* RP2350 port: save from the background worker, as clearing I&M
+          * data does. Saving here, in the task that also sends the cyclic
+          * frames, stalls them for a flash sector erase (45-400 ms) */
+         (void)pf_bg_worker_start_job (net, PF_BGJOB_SAVE_IM_NVM_DATA);
       }
    }
    else

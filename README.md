@@ -12,7 +12,7 @@ this board (`lib/pnet/port`). Ethernet is the board's WIZ850io (W5500), used as 
 
 ## Status
 
-**Ported, and builds with Pico SDK 2.3.1 and 2.2.0. Not yet tested on the board.** The application
+**Ported, and builds with Pico SDK 2.3.1, 2.2.0 and 2.1.1. Not yet tested on the board.** The application
 is p-net's sample application, unchanged, as on the ESP32-P4, so the GSDML in `gsdml/` and the
 TIA Portal project from the ESP32-P4 apply as they are. Only the station name differs
 (`rp2350-io`).
@@ -43,13 +43,16 @@ What the sample application uses on this board (`src/config.h`):
 | Signal LED | all 12 WS2812B LEDs, white | TIA Portal's *Flash LED* |
 | Button 2 (alarm demo) | none (`PNIO_BUTTON2_GPIO`) | |
 
-Output bit 7 switches 24 V on X3-1. The outputs are off from reset, and p-net sets the PLC's
-outputs to 0 when the connection ends. WS2812B LED 0 is green while the Ethernet link is up and
-red without it. LED1 (GP7) is on while the firmware runs. GP7 is also the SD card's chip select,
-and high keeps the card off the SPI bus it shares with the W5500.
+Output bit 7 switches 24 V on X3-1. The outputs are off from reset, p-net sets the PLC's outputs
+to 0 when the connection ends, and a crash or hang turns them off (see *Watchdog* below). WS2812B
+LED 0 is green while the Ethernet link is up and red without it.
 
-The RS-485 driver and the RM2 radio are kept off; the display, the analog inputs, the SD card and
-the RS-232 port are not used yet.
+LED1 (GP7) is lit from the start. It is not a heartbeat: GP7 is also the SD card's chip select and
+stays high. A card in the slot is put into SPI mode at start, so that the high chip select keeps it
+off the SPI bus it shares with the W5500. The log then says `eth: SD card in the slot: ...`.
+
+The RS-485 driver and the RM2 radio are kept off, and the RS-232 transmitter idles. The display,
+the analog inputs, the SD card and the RS-232 port are not used yet.
 
 ## Layout
 
@@ -95,11 +98,16 @@ How the port works:
   `p-net_bg_worker` (saving to flash), the LEDs, the log.
 - **Storage.** p-net's files (`pnet_data_ip.bin`, `pnet_data_im.bin`, ...) are records in the last
   56 KB of the flash, two 4 KB sectors per file. Each save goes to the sector without the newest
-  copy, so a reset during a save keeps the previous one. Flashing new firmware keeps them.
-  *Reset to factory settings* in TIA Portal clears them.
+  copy, so a reset during a save keeps the previous one. Saves run in p-net's background task
+  (`patches/0003` moves the I&M save there too). Flashing new firmware keeps them. *Reset to factory
+  settings* in TIA Portal clears them: a page program per copy, no erase.
+- **Watchdog.** The sample application's main loop feeds the RP2350's watchdog. If it stops for
+  1 s (`PNIO_WATCHDOG_MS`), the chip resets, which switches the 24 V outputs off. A stack overflow,
+  hard fault or `panic()` switches them off at once and restarts. The log says why after the
+  restart (`pnio: restarted ...`).
 - **Running from RAM.** The firmware is copied to RAM at start (`copy_to_ram`): the flash can be
   erased while the PROFINET tasks keep running, and nothing waits for the flash cache. That uses
-  about 470 of the 520 KB of RAM.
+  about 460 of the 520 KB of RAM (about 500 KB with the SDK's `Release`, -O3).
 
 ## Build and flash
 
@@ -142,13 +150,15 @@ The settings are in `src/config.h`:
 - which 24 V input and output the sample application uses
 - the WS2812B LEDs: count, brightness, which one shows the link
 - the W5500's SPI clock (default 25 MHz)
+- the watchdog time (default 1 s)
 - task priorities and stacks
 
 The text ones can also be given to CMake, for example `-DPNIO_STATION_NAME=my-io`. The p-net log
 level is the CMake variable `PNET_LOG_LEVEL` (0 debug, 1 info, 2 warning, 3 error).
 
 The log is on USB: the board appears as a COM port (USB serial). Any terminal works; the baud rate
-does not matter. It shows the start, `eth: link up, ...`, and what p-net logs. To get the log on the
+does not matter. (Opening it at 1200 baud does not restart the board into BOOTSEL here, as it
+would with most Pico firmware.) It shows the start, `eth: link up, ...`, and what p-net logs. To get the log on the
 RS-232 port (X2, 115200 baud) instead, change `pico_enable_stdio_usb` / `pico_enable_stdio_uart` in
 `CMakeLists.txt`.
 
@@ -224,13 +234,20 @@ every frame crosses SPI.
 
 `lib/pnet/p-net` is the v0.2.0 tag (`src`, `include` and `sample_app`, without the ports and
 tests) plus the patches in `lib/pnet/patches`, already applied. After copying p-net again, run
-`patch -p1 < ../patches/0001-pdport-peer-check-exact-port-name.patch` inside `p-net/`.
+`patch -p1 < ../patches/<each patch>` inside `p-net/`, in order.
 
 - **`0001-pdport-peer-check-exact-port-name.patch`** (from the ESP32-P4 project). The topology
   check (the PLC's PDPortDataCheck, when a partner port is set in TIA Portal) compared the
   neighbour's whole LLDP port ID with the expected port name. An S7-1200 sends `port-001.plc`, so
   the check always failed with "Wrong partner port". It now compares the port name only, and both
   name checks need an exact match.
+- **`0002-pnet-init-free-with-os-free.patch`.** When `pnet_init()` fails it freed its state with
+  `free()`, but allocated it with `os_malloc()`. Here that is the FreeRTOS heap, so `free()` would
+  corrupt newlib's heap. It now uses `os_free()`.
+- **`0003-fspm-save-im-in-background-worker.patch`.** An I&M write from the PLC or TIA Portal was
+  saved at once, in the task that also sends the cyclic frames. On this board a save erases a
+  flash sector (45–400 ms), long enough for the PLC's watchdog to drop the connection. It is now
+  saved by p-net's background worker, as clearing I&M data already was.
 
 ## Topology: partner ports in TIA Portal
 

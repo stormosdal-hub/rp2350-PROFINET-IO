@@ -30,8 +30,11 @@ int w5500_init(const w5500_cfg_t *cfg, const uint8_t mac[6]);
 /* Close and open the MACRAW socket again, dropping what is buffered. */
 bool w5500_reopen(void);
 
-/* Whether the MACRAW socket is open (it is not after a chip reset, for example by a brown-out). */
+/* Whether the MACRAW socket is open. */
 bool w5500_socket_ok(void);
+
+/* Whether the chip still has w5500_init()'s settings (a reset, by a brown-out say, undoes them). */
+bool w5500_settings_ok(void);
 
 void w5500_get_phy(w5500_phy_t *phy);
 

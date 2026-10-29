@@ -76,9 +76,12 @@ target_link_libraries(rp2350_profinet_io PRIVATE
     hardware_spi
 )
 
-# The log goes to USB (a COM port); stdio over the RS-232 port instead: PICO_STDIO_UART=1
+# The log goes to USB (a COM port). For the RS-232 port (X2, 115200 baud) instead, swap the 1 and 0
 pico_enable_stdio_usb(rp2350_profinet_io 1)
 pico_enable_stdio_uart(rp2350_profinet_io 0)
+# A terminal that opens the COM port at 1200 baud would otherwise restart the board as the BOOTSEL
+# drive (picotool -f still reboots it, through its own USB interface)
+target_compile_definitions(rp2350_profinet_io PRIVATE PICO_ENABLE_USB_RESET_VIA_BAUD_RATE=0)
 
 # All of it runs from RAM: nothing runs from flash while p-net saves to it (files_rp2.c), so the
 # PROFINET tasks keep running then, and the cyclic path never waits for the flash cache

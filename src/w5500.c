@@ -22,6 +22,7 @@
 // common registers
 #define MR       0x0000
 #define SHAR     0x0009
+#define INTLEVEL 0x0013
 #define IMR      0x0016
 #define SIMR     0x0018
 #define PHYCFGR  0x002e
@@ -49,6 +50,7 @@
 #define Sn_CR_RECV   0x40
 #define Sn_IR_SENDOK 0x10
 #define Sn_IR_RECV   0x04
+#define SOCK_CLOSED  0x00
 #define SOCK_MACRAW  0x42
 #define PHY_LNK      0x01
 #define PHY_SPD      0x02
@@ -129,14 +131,23 @@ static bool command(uint8_t cmd)
     return false;
 }
 
+static bool status_becomes(uint8_t status)
+{
+    for (int i = 0; i < 100; i++) {
+        if (read8(BLOCK_S0, Sn_SR) == status) return true;
+    }
+    return false;
+}
+
+// a cleared Sn_CR means the command was taken, not done: wait for the status too
 bool w5500_reopen(void)
 {
-    command(Sn_CR_CLOSE);
-    write8(BLOCK_S0, Sn_IR, 0xff);
-    write8(BLOCK_S0, Sn_MR, Sn_MR_MACRAW | Sn_MR_MIP6B);
-    if (!command(Sn_CR_OPEN)) return false;
-    for (int i = 0; i < 100; i++) {
-        if (read8(BLOCK_S0, Sn_SR) == SOCK_MACRAW) return true;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        command(Sn_CR_CLOSE);
+        status_becomes(SOCK_CLOSED);
+        write8(BLOCK_S0, Sn_IR, 0xff);
+        write8(BLOCK_S0, Sn_MR, Sn_MR_MACRAW | Sn_MR_MIP6B);
+        if (command(Sn_CR_OPEN) && status_becomes(SOCK_MACRAW)) return true;
     }
     return false;
 }
@@ -175,14 +186,20 @@ int w5500_init(const w5500_cfg_t *c, const uint8_t mac[6])
         write8(BLOCK_SOCKET(n), Sn_RXBUF_SIZE, n ? 0 : 16);
         write8(BLOCK_SOCKET(n), Sn_TXBUF_SIZE, n ? 0 : 16);
     }
-    // INTn only for "socket 0 received"
+    // INTn for socket 0 only. Sn_IR only sets the bits Sn_IMR lets through (datasheet; ESP-IDF's
+    // W5500 driver enables SEND_OK for this): w5500_tx_commit() waits for SEND_OK
     write8(BLOCK_COMMON, IMR, 0);
     write8(BLOCK_COMMON, SIMR, 0x01);
-    write8(BLOCK_S0, Sn_IMR, Sn_IR_RECV);
+    write8(BLOCK_S0, Sn_IMR, Sn_IR_RECV | Sn_IR_SENDOK);
+    // INTn goes high for ~7 us (256 x 4 PLL clocks) before it asserts again: always an edge
+    write16(BLOCK_COMMON, INTLEVEL, 0x0100);
     return w5500_reopen() ? version : -1;
 }
 
 bool w5500_socket_ok(void) { return read8(BLOCK_S0, Sn_SR) == SOCK_MACRAW; }
+
+// what w5500_init() set and a chip reset undoes (both 0 and 2 KB afterwards)
+bool w5500_settings_ok(void) { return read8(BLOCK_COMMON, SIMR) == 0x01 && read8(BLOCK_S0, Sn_RXBUF_SIZE) == 16; }
 
 void w5500_get_phy(w5500_phy_t *phy)
 {

@@ -111,7 +111,8 @@ pnet_t * pnet_init (const pnet_cfg_t * p_cfg)
 
    if (pnet_init_only (net, p_cfg) != 0)
    {
-      free (net);
+      /* RP2350 port: os_malloc() above is not malloc() on every port */
+      os_free (net);
       return NULL;
    }
 

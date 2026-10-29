@@ -21,9 +21,8 @@
 #define DEFAULT_ACCEPTMBOX_SIZE         4
 #define LWIP_COMPAT_MUTEX               0
 
-/* the C library: newlib */
+/* the C library: newlib's errno (lwIP tests LWIP_PROVIDE_ERRNO with #ifdef: leave it undefined) */
 #define LWIP_ERRNO_STDINCLUDE           1
-#define LWIP_PROVIDE_ERRNO              0
 #define LWIP_TIMEVAL_PRIVATE            0
 
 /* Memory */
@@ -70,15 +69,15 @@
 
 /* The interface */
 #define LWIP_SINGLE_NETIF               1
-#define LWIP_NETIF_STATUS_CALLBACK      1   // eth.c logs each new address
+#define LWIP_NETIF_STATUS_CALLBACK      0
+#define LWIP_NETIF_EXT_STATUS_CALLBACK  1   // eth.c logs each new address, netmask and gateway
 #define LWIP_NETIF_LINK_CALLBACK        0
 #define LWIP_NETIF_HOSTNAME             0
 #define LWIP_NETIF_TX_SINGLE_PBUF       0
 #define ETH_PAD_SIZE                    0
 
-/* Off */
+/* Off. (LWIP_DEBUG is tested with #ifdef: defining it, even as 0, turns on lwIP's blocking printf) */
 #define LWIP_STATS                      0
-#define LWIP_DEBUG                      0
 #define CHECKSUM_CHECK_IP               1
 #define CHECKSUM_CHECK_UDP              1
 #define CHECKSUM_CHECK_ICMP             1

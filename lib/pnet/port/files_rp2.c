@@ -5,10 +5,11 @@
  * newest record with a good CRC is the file. Flashing new firmware keeps them; TIA Portal's
  * "Reset to factory settings" clears them.
  *
- * While a sector is erased (~45 ms, at worst 400 ms) or programmed nothing may run from flash. In
- * a copy_to_ram build nothing does, and the PROFINET tasks keep running; otherwise the interrupts
- * are off for that time. p-net saves only what changed, from its background task: on a new name
- * or address, I&M data from the PLC, and the port data of the first connection.
+ * A save erases a sector (~45 ms, at worst 400 ms) and programs it. p-net saves only what changed:
+ * once at start if needed, then from its background worker (a new name or address, I&M data from
+ * the PLC, port data from the first connection; patches/0003 moves the I&M save there). While the
+ * flash is erased or programmed nothing may run from it. In a copy_to_ram build nothing does, and
+ * the PROFINET tasks keep running; otherwise the interrupts are off for that time.
  */
 #include <string.h>
 #include "FreeRTOS.h"
@@ -57,10 +58,11 @@ static uint32_t sector_offset(int file, int half)
     return AREA_OFFSET + (uint32_t)(file * 2 + half) * FLASH_SECTOR_SIZE;
 }
 
-// read through the uncached alias: the XIP cache keeps the firmware, not these
+// read through the uncached, untranslated alias: the XIP cache keeps the firmware, not these, and
+// the offsets are the physical ones flash_range_erase() and flash_range_program() take
 static const record_t *record(int file, int half)
 {
-    return (const record_t *)(XIP_NOCACHE_NOALLOC_BASE + sector_offset(file, half));
+    return (const record_t *)(XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE + sector_offset(file, half));
 }
 
 static bool valid(const record_t *r)
@@ -119,6 +121,7 @@ int pnal_rp2_files_init(void)
     if (lock) return usable ? 0 : -1;
     lock = xSemaphoreCreateMutex();
     if (!lock) return -1;
+    // the image starts at flash offset 0 (no partition table on this board)
     uint32_t firmware_end = (uint32_t)(uintptr_t)&__flash_binary_end - XIP_BASE;
     usable = firmware_end <= AREA_OFFSET;
     if (!usable) {
@@ -179,15 +182,21 @@ int pnal_load_file(const char *fullpath, void *object_1, size_t size_1, void *ob
     return ret;
 }
 
-// both copies; a sector that is still erased is left alone
+// Each good copy gets its magic programmed to 0, the older one first: one page program each
+// (< 3 ms) and no erase, since this runs in the receive task (DCP "Reset to factory") and the next
+// save erases the sector anyway. A reset in between leaves the newest copy or none, never an older.
 void pnal_clear_file(const char *fullpath)
 {
-    static const record_t blank = { 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu };
+    uint8_t page[FLASH_PAGE_SIZE];
     int file = file_of(fullpath);
     if (file < 0 || !usable) return;
+    memset(page, 0xff, sizeof(page));
+    memset(page, 0, sizeof(((record_t *)0)->magic));
     xSemaphoreTake(lock, portMAX_DELAY);
-    for (int half = 0; half < 2; half++) {
-        if (memcmp(record(file, half), &blank, sizeof(blank)) != 0) erase(sector_offset(file, half));
+    int last = newest(file);
+    if (last >= 0) {
+        if (valid(record(file, 1 - last))) program(sector_offset(file, 1 - last), page, sizeof(page));
+        program(sector_offset(file, last), page, sizeof(page));
     }
     xSemaphoreGive(lock);
 }

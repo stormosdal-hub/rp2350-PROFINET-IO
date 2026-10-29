@@ -75,6 +75,14 @@
 #define PNIO_ETH_SPI_BAUD 33000000
 #endif
 
+/* ---- Watchdog ---- */
+
+// Fed by the sample application's main loop (every ~11 ms); when it stops for this long the chip
+// resets, which also switches the 24 V outputs off. 0: no watchdog
+#ifndef PNIO_WATCHDOG_MS
+#define PNIO_WATCHDOG_MS 1000
+#endif
+
 /* ---- Tasks (FreeRTOS priorities 0..31, stacks in bytes) ---- */
 
 // os_timer (p-net's 1 ms tick) runs at 30, above all of these; lwIP's tcpip thread at 20
